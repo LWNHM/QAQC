@@ -1,0 +1,60 @@
+# Script to convert ALL tiffs into jpegs
+# Use current folder as source
+$sourceFolder = Get-Location
+$destinationFolder = Join-Path $sourceFolder "Jpgs"
+# Ensure output folder exists
+if (-not (Test-Path $destinationFolder)) {
+    New-Item -ItemType Directory -Path $destinationFolder | Out-Null
+}
+# Load System.Drawing
+Add-Type -AssemblyName System.Drawing
+# Get ALL TIFF files
+$tiffFiles = Get-ChildItem -Path $sourceFolder -Filter *.tif -File  # Add -Recurse if needed
+$totalFiles = $tiffFiles.Count
+Write-Host "📊 Total TIFF files found: $totalFiles"
+if ($totalFiles -eq 0) {
+    Write-Host "ℹ️ No .tif files found. Nothing to do."
+    pause
+    return
+}
+# Set throttle limit
+$maxConcurrent = 8  # Adjust this number based on your system resources
+$jobs = @()
+foreach ($file in $tiffFiles) {
+    # Wait if too many jobs are running
+    while ((Get-Job -State Running).Count -ge $maxConcurrent) {
+        Start-Sleep -Milliseconds 200
+    }
+    # Start conversion job
+    $job = Start-Job -ScriptBlock {
+        param($filePath, $destinationFolder)
+        Add-Type -AssemblyName System.Drawing
+        $fileName    = [System.IO.Path]::GetFileNameWithoutExtension($filePath)
+        $newFilePath = Join-Path $destinationFolder ($fileName + ".jpg")
+        if (-not (Test-Path $newFilePath)) {
+            try {
+                $image = [System.Drawing.Image]::FromFile($filePath)
+                # Prepare JPEG encoder with quality = 85
+                $jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+                             Where-Object { $_.MimeType -eq "image/jpeg" }
+                $encoderParams  = New-Object System.Drawing.Imaging.EncoderParameters(1)
+                $qualityEncoder = [System.Drawing.Imaging.Encoder]::Quality
+                $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter($qualityEncoder, 85L)
+                # Save as JPEG
+                $image.Save($newFilePath, $jpegCodec, $encoderParams)
+                $image.Dispose()
+                Write-Output "✅ Converted: $fileName.jpg"
+            } catch {
+                Write-Output "❌ Error converting: $fileName.tif — $($_.Exception.Message)"
+            }
+        } else {
+            Write-Output "⏩ Skipped (already exists): $fileName.jpg"
+        }
+    } -ArgumentList $file.FullName, $destinationFolder
+    $jobs += $job
+}
+# Wait for all jobs to finish
+Write-Host "`n⏳ Converting all $totalFiles files with throttle limit ($maxConcurrent)..."
+$jobs | ForEach-Object { Receive-Job $_ -Wait; Remove-Job $_ }
+Write-Host "`n🎉 All files have been processed."
+pause
