@@ -1,0 +1,104 @@
+# This script is also generation MD5#. SHA-256 would technically be more information, but our image ingest blockage can be due to MD5# clash, therefore MD5# is more useful, than SHA-256
+# It also includes a progress bar with ETA
+
+Add-Type -AssemblyName PresentationCore
+# Get the current working directory
+$path = Get-Location
+# Get folder name for the report filename
+$folderName = Split-Path $path -Leaf
+$reportFileName = "${folderName}_ImageScanReport.csv"
+$reportPath = Join-Path $path $reportFileName
+# Prepare results array
+$results = @()
+# Hashing object for MD5 checksums
+$md5 = [System.Security.Cryptography.MD5]::Create()
+# Image types to scan
+$imageExtensions = "*.jpg","*.jpeg","*.png","*.tif","*.tiff","*.bmp","*.gif"
+function Test-WICImage {
+    param($path)
+    try {
+        $uri = New-Object System.Uri($path)
+        $stream = New-Object System.IO.FileStream($path, 'Open', 'Read')
+        $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
+            $stream,
+            [System.Windows.Media.Imaging.BitmapCreateOptions]::IgnoreColorProfile,
+            [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        )
+        $decoder.Frames.Count | Out-Null
+        $stream.Close()
+        return @{ Valid = $true; Metadata = "OK" }
+    }
+    catch {
+        return @{ Valid = $false; Metadata = $_.Exception.Message }
+    }
+}
+# ----------------------------------------------------
+# Count all image files for accurate progress & ETA
+# ----------------------------------------------------
+$allFiles = foreach ($ext in $imageExtensions) {
+    Get-ChildItem -Path $path -Filter $ext -File
+}
+$totalFiles = $allFiles.Count
+$counter = 0
+# Start timer for ETA
+$startTime = Get-Date
+foreach ($file in $allFiles) {
+    # Update counters
+    $counter++
+    $percent = [math]::Round(($counter / $totalFiles) * 100)
+    # --- ETA CALCULATION ---
+    $elapsed = (Get-Date) - $startTime
+    if ($counter -gt 0) {
+        $secondsPerFile = $elapsed.TotalSeconds / $counter
+        $remainingSeconds = ($totalFiles - $counter) * $secondsPerFile
+        $eta = [TimeSpan]::FromSeconds($remainingSeconds)
+    } else {
+        $eta = ""
+    }
+    Write-Progress `
+        -Activity "Scanning Images ($counter of $totalFiles)" `
+        -Status "Processing: $($file.Name) | ETA: $($eta.ToString())" `
+        -PercentComplete $percent
+    $status = "Valid"
+    $errorMessage = ""
+    # --- MD5 checksum ---
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        $hashBytes = $md5.ComputeHash($bytes)
+        $md5Checksum = ($hashBytes | ForEach-Object { $_.ToString("x2") }) -join ""
+    }
+    catch {
+        $md5Checksum = ""
+        $status = "Corrupted"
+        $errorMessage += "Checksum failed: $($_.Exception.Message) "
+    }
+    # --- WIC Image Validation ---
+    $result = Test-WICImage $file.FullName
+    if (-not $result.Valid) {
+        $status = "Corrupted"
+        $errorMessage += "Image load failed: $($result.Metadata) "
+    }
+    # Metadata
+    $metadataStatus = $result.Metadata
+    # --- File size check: now 100 MB ---
+    if ($file.Length -lt 100MB) {
+        $status = "Corrupted"
+        $errorMessage += "File too small (<100 MB). "
+    }
+    # Build output record
+    $results += [PSCustomObject]@{
+        FileName       = $file.Name
+        FullPath       = $file.FullName
+        FileSizeBytes  = $file.Length
+        MD5            = $md5Checksum
+        Status         = $status
+        MetadataStatus = $metadataStatus
+        ErrorMessage   = $errorMessage.Trim()
+    }
+}
+# Clear progress
+Write-Progress -Activity "Scanning Images" -Completed
+# Export report
+$results | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+Write-Host "Scan complete. Report saved to:" -ForegroundColor Yellow
+Write-Host $reportPath -ForegroundColor Cyan
