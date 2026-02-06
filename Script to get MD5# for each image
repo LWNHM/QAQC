@@ -1,0 +1,37 @@
+# Source folder to scan
+$sourceFolder = Get-Location
+# Get the name of the source folder
+$folderName = Split-Path $sourceFolder -Leaf
+# Destination folder for the output spreadsheet (ensure it exists)
+$destinationFolder = "C:\Users\krisl\OneDrive - Natural History Museum\^DMT - Data Management stuff\Solanaceae images"
+if (-not (Test-Path $destinationFolder)) {
+    New-Item -ItemType Directory -Path $destinationFolder | Out-Null
+}
+# Output file path with folder name included
+$outputFile = Join-Path $destinationFolder ("Image_MD5_List_" + $folderName + ".csv")
+# Get all image files (including subfolders)
+$imageFiles = Get-ChildItem -Path $sourceFolder -File -Include *.tif, *.tiff, *.jpg, *.jpeg, *.png -Recurse
+# If nothing found, inform and stop
+if (-not $imageFiles) {
+    Write-Host "ℹ️ No image files found in: $sourceFolder"
+    Write-Host "   (Looking for: .tif .tiff .jpg .jpeg .png)"
+    pause
+    return
+}
+# Compute MD5 and collect results
+$results = foreach ($file in $imageFiles) {
+    try {
+        $hash = Get-FileHash -Path $file.FullName -Algorithm MD5
+        [PSCustomObject]@{
+            Filename = $file.Name
+            FullPath = $file.FullName
+            MD5      = $hash.Hash
+        }
+    } catch {
+        Write-Host "❌ Error processing $($file.Name): $($_.Exception.Message)"
+    }
+}
+# Export to CSV
+$results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+Write-Host "`n✅ Spreadsheet created: $outputFile"
+pause
