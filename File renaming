@@ -1,0 +1,27 @@
+#The script is to rename .tif files, adding _sheet in the filename
+
+$folder = Get-Location
+
+# Get ALL tif and tiff files using wildcard path matching
+$files = Get-ChildItem "$folder\*.tif", "$folder\*.tiff" -File
+
+$total = $files.Count
+$index = 0
+
+foreach ($file in $files) {
+
+    $index++
+
+    # Progress bar text — safe formatting
+    $statusText = "Processing $index of $total - " + $file.Name
+
+    Write-Progress -Activity "Renaming TIFF Files" -Status $statusText -PercentComplete (($index / $total) * 100)
+
+    # Build new name
+    $newName = $file.BaseName + "_sheet" + $file.Extension
+
+    # Rename
+    Rename-Item -Path $file.FullName -NewName $newName
+}
+
+Write-Host "Done! Renamed $total TIFF file(s)." -ForegroundColor Green
