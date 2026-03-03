@@ -1,0 +1,46 @@
+# Powershell script to use the sampling csv file to copy entom jpgs for QC sample 
+# Run this from the folder containing Daily_Output_Originals, Jpeg_Samples, and the CSV
+$baseFolder   = Get-Location
+$csvFile      = Join-Path $baseFolder "All_Files_From_Digitisation_Image_Output_Pending_QC.csv"
+$jpegBase     = Join-Path $baseFolder "Jpeg_Samples"
+
+# Ensure Jpeg_Samples exists
+if (-not (Test-Path $jpegBase)) {
+    New-Item -ItemType Directory -Path $jpegBase | Out-Null
+}
+
+# Load CSV
+$rows = Import-Csv -Path $csvFile
+
+# Filter only sampled files
+$sampledFiles = $rows | Where-Object { $_.Sampled -eq "Yes" }
+
+foreach ($row in $sampledFiles) {
+    $sourcePath = $row.FullFilePath
+    $parentName = $row.SourceFolder
+    $fileName   = $row.Filename   # already a JPG
+
+    # Destination folder = Jpeg_Samples\<ParentFolder>
+    $destFolder = Join-Path $jpegBase $parentName
+    if (-not (Test-Path $destFolder)) {
+        New-Item -ItemType Directory -Path $destFolder | Out-Null
+    }
+
+    $destPath = Join-Path $destFolder $fileName
+
+    # Skip if already copied
+    if (Test-Path $destPath) {
+        Write-Host "⏩ Skipping existing file: $fileName"
+        continue
+    }
+
+    try {
+        Copy-Item -Path $sourcePath -Destination $destPath
+        Write-Host "✅ Copied: $fileName"
+    } catch {
+        Write-Host "❌ Error copying: $sourcePath"
+    }
+}
+
+Write-Host "`n🎉 Copy complete. JPGs saved in 'Jpeg_Samples' with replicated folder structure."
+pause
