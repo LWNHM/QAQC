@@ -1,0 +1,168 @@
+# --------------------------------------------------------
+# Barcode-Family Sampling Script (Per Subfolder)
+# Run this INSIDE the Daily_Output_Originals folder
+# --------------------------------------------------------
+
+# =========================
+# CONFIGURATION
+# =========================
+$FamiliesPerTrigger = 5
+$ConfidenceZ = 1.645   # 90% confidence
+$MarginError = 0.1
+$P = 0.5
+
+# =========================
+# OUTPUT CSV (ONE LEVEL UP)
+# =========================
+$runFolder   = Get-Location
+$parentFolder = Split-Path $runFolder -Parent
+$reportFile = Join-Path $parentFolder "All_Files_From_Digitisation_Image_Output_Pending_QC.csv"
+
+# =========================
+# Helper: human-readable file size
+# =========================
+function Get-HumanSize {
+    param([long]$bytes)
+    if ($bytes -ge 1GB) { "{0:N2} GB" -f ($bytes / 1GB) }
+    elseif ($bytes -ge 1MB) { "{0:N2} MB" -f ($bytes / 1MB) }
+    else { "{0:N2} KB" -f ($bytes / 1KB) }
+}
+
+# =========================
+# Collect all output rows
+# =========================
+$allRows = @()
+
+# =========================
+# Process EACH subfolder independently
+# =========================
+$subFolders = Get-ChildItem -Directory
+
+foreach ($folder in $subFolders) {
+
+    Write-Host "Processing folder:" $folder.Name
+
+    # ---------------------------------
+    # STEP 1 — Load files
+    # ---------------------------------
+   
+$allFiles = Get-ChildItem -Path $folder.FullName -File |
+    Where-Object {
+        $_.Extension -notin @('.txt') -and
+        $_.Name -notmatch '(?i)thumb'
+    } |
+    Sort-Object CreationTime
+    if ($allFiles.Count -eq 0) {
+        Write-Host "  (No files found — skipping)"
+        continue
+    }
+
+    # ---------------------------------
+    # STEP 2 — Extract barcode
+    # ---------------------------------
+    $filesWithBarcode = $allFiles | ForEach-Object {
+        [PSCustomObject]@{
+            File    = $_
+            Barcode = $_.BaseName.Split("_")[0]
+            Created = $_.CreationTime
+        }
+    }
+
+    # ---------------------------------
+    # STEP 3 — Group into families
+    # ---------------------------------
+    $families = $filesWithBarcode |
+        Group-Object Barcode |
+        ForEach-Object {
+            $familyFiles = $_.Group
+            $familyCreated = ($familyFiles | Sort-Object Created | Select-Object -First 1).Created
+
+            [PSCustomObject]@{
+                Barcode       = $_.Name
+                FamilyCreated = $familyCreated
+            }
+        } |
+        Sort-Object FamilyCreated
+
+    # ---------------------------------
+    # STEP 4 — Mandatory sampling
+    # ---------------------------------
+    $sampleMap = @{}
+
+    # First N families per day
+    $families |
+        Group-Object { $_.FamilyCreated.Date } |
+        ForEach-Object {
+            $_.Group | Select-Object -First $FamiliesPerTrigger | ForEach-Object {
+                $sampleMap[$_.Barcode] = "DailyStart"
+            }
+        }
+
+    # Gaps > 1 hour
+    $lastTime = $null
+    for ($i = 0; $i -lt $families.Count; $i++) {
+        $fam = $families[$i]
+
+        if ($lastTime) {
+            $gapHours = ($fam.FamilyCreated - $lastTime).TotalHours
+            if ($gapHours -gt 1) {
+                for ($j = $i; $j -lt [Math]::Min($i + $FamiliesPerTrigger, $families.Count); $j++) {
+                    $sampleMap[$families[$j].Barcode] = "GapRestart"
+                }
+            }
+        }
+        $lastTime = $fam.FamilyCreated
+    }
+
+    # ---------------------------------
+    # STEP 5 — Random sample
+    # ---------------------------------
+    $remaining = $families | Where-Object {
+        -not $sampleMap.ContainsKey($_.Barcode)
+    }
+
+    if ($remaining.Count -gt 0) {
+        $n0 = [math]::Pow($ConfidenceZ, 2) * $P * (1 - $P) / [math]::Pow($MarginError, 2)
+        $n  = [math]::Round($n0 / (1 + (($n0 - 1) / $remaining.Count)))
+        if ($n -lt 1) { $n = 1 }
+
+        $rng = New-Object System.Random
+        $remaining |
+            Sort-Object { $rng.Next() } |
+            Select-Object -First $n |
+            ForEach-Object {
+                $sampleMap[$_.Barcode] = "Random"
+            }
+    }
+
+    # ---------------------------------
+    # STEP 6 — Expand back to files
+    # ---------------------------------
+    foreach ($f in $filesWithBarcode) {
+        $file = $f.File
+        $barcode = $f.Barcode
+        $sampled = $sampleMap.ContainsKey($barcode)
+
+        $allRows += [PSCustomObject]@{
+            SourceFolder = $folder.Name
+            FullFilePath = $file.FullName
+            Filename     = $file.Name
+            Barcode      = $barcode
+            FileSize     = Get-HumanSize $file.Length
+            FileType     = $file.Extension.TrimStart(".")
+            CreatedDate  = $file.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
+            ModifiedDate = $file.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            Sampled      = if ($sampled) { "Yes" } else { "No" }
+            SampleReason = if ($sampled) { $sampleMap[$barcode] } else { "" }
+        }
+    }
+}
+
+# =========================
+# STEP 7 — Export CSV
+# =========================
+$allRows | Export-Csv -Path $reportFile -NoTypeInformation -Encoding UTF8
+
+Write-Host "`n🎉 QC sample CSV created:"
+Write-Host $reportFile
+pause
