@@ -1,0 +1,60 @@
+# Powershell script to use the sampling csv file to copy and convert herbarium tiffs to jpgs for QC sample
+# Run this from the folder containing Daily_Output_Originals, Jpeg_Samples, and the CSV
+$baseFolder   = Get-Location
+$csvFile      = Join-Path $baseFolder "All_Files_From_Digitisation_Image_Output_Pending_QC.csv"
+$jpegBase     = Join-Path $baseFolder "Jpeg_Samples"
+
+# Ensure Jpeg_Samples exists
+if (-not (Test-Path $jpegBase)) {
+    New-Item -ItemType Directory -Path $jpegBase | Out-Null
+}
+
+# Load CSV
+$rows = Import-Csv -Path $csvFile
+
+# Filter only sampled files
+$sampledFiles = $rows | Where-Object { $_.Sampled -eq "Yes" }
+
+# Load System.Drawing for image conversion
+Add-Type -AssemblyName System.Drawing
+
+foreach ($row in $sampledFiles) {
+    $sourcePath = $row.FullFilePath
+    $parentName = $row.ParentFolder
+    $fileName   = [System.IO.Path]::GetFileNameWithoutExtension($row.Filename) + ".jpg"
+
+    # Destination folder = Jpeg_Samples\<ParentFolder>
+    $destFolder = Join-Path $jpegBase $parentName
+    if (-not (Test-Path $destFolder)) {
+        New-Item -ItemType Directory -Path $destFolder | Out-Null
+    }
+
+    $destPath = Join-Path $destFolder $fileName
+
+    # Skip if already converted
+    if (Test-Path $destPath) {
+        Write-Host "⏩ Skipping existing file: $fileName"
+        continue
+    }
+
+    try {
+        $image = [System.Drawing.Image]::FromFile($sourcePath)
+
+        $jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+                     Where-Object { $_.MimeType -eq "image/jpeg" }
+        $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+        $qualityEncoder = [System.Drawing.Imaging.Encoder]::Quality
+        $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter($qualityEncoder, 85L)
+
+        $image.Save($destPath, $jpegCodec, $encoderParams)
+        $image.Dispose()
+
+        Write-Host "✅ Converted: $fileName"
+    } catch {
+        Write-Host "❌ Error converting: $sourcePath"
+    }
+}
+
+Write-Host "`n🎉 Conversion complete. JPGs saved in 'Jpeg_Samples' with replicated folder structure."
+pause
+
