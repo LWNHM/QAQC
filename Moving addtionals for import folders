@@ -1,0 +1,48 @@
+# Powershell script for moving entom additional images out of inselect script import folder into axiozoom ingest folder
+
+# CHANGE THE SOURCE AND DESTINATION FOLDERS
+
+# Define source and destination roots
+$sourceRoot = "Y:\IMPORT_Entom\Pinned_Drepanidae"
+$destRoot   = "Y:\IMPORT_Entom\Pinned_Drepanidae_additional"
+
+# Get all subfolders under the source root
+$subfolders = Get-ChildItem -Path $sourceRoot -Directory
+
+foreach ($subfolder in $subfolders) {
+    Write-Host "🔍 Checking folder: $($subfolder.FullName)"
+
+    # Find files containing "additional" in their name
+    $files = Get-ChildItem -Path $subfolder.FullName -File -Recurse |
+             Where-Object { $_.Name -match "additional" }
+
+    if ($files.Count -eq 0) {
+        Write-Host "⏩ No 'additional' files found in $($subfolder.Name)"
+        continue
+    }
+
+    # Build destination folder path (mirror structure)
+    $destFolder = Join-Path $destRoot $subfolder.Name
+
+    # Create destination folder if it doesn't exist
+    if (-not (Test-Path $destFolder)) {
+        New-Item -ItemType Directory -Path $destFolder | Out-Null
+        Write-Host "📂 Created destination folder: $destFolder"
+    }
+
+    # Move each file
+    foreach ($file in $files) {
+        $destPath = Join-Path $destFolder $file.Name
+
+        try {
+            Move-Item -Path $file.FullName -Destination $destPath -Force
+            Write-Host "✅ Moved: $($file.Name) → $destPath"
+        }
+        catch {
+            Write-Warning "⚠️ Could not move $($file.FullName): $_"
+        }
+    }
+}
+
+Write-Host "`n🎉 Done! All 'additional' files moved to mirrored folders under Pinned_additional."
+pause
