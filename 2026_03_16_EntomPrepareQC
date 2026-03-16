@@ -1,0 +1,378 @@
+
+<# 
+Create-Entom-QC-Run.ps1
+What it does:
+- Detects all project folders starting with "Entom*" under Y:\Digitisation_Image_Output_Pending_QC
+- Finds top-level daily digitiser folders (YYYY_MM_DD_*)
+- Confirmation popup with per-project counts
+- Creates QC_Started_YYYY_MM_DD\Daily_Originals and Jpeg_Samples
+- Copies (or moves) daily folders into project subfolders under Daily_Originals
+- Runs barcode-family sampling logic (same as your script), per daily folder
+- Builds ONE combined CSV at QC_Started_YYYY_MM_DD\Combined_Sampling_Report.csv
+- Copies ALL sampled files (all types except .txt and *_thumb*) into Jpeg_Samples, preserving project/daily structure
+- Opens the QC folder at the end
+Default: COPY mode for safe testing. Change $Operation = 'Move' when ready.
+#>
+# =========================
+# SETTINGS
+# =========================
+Add-Type -AssemblyName PresentationFramework
+# Root folder containing Entom projects
+$Root = "Y:\Digitisation_Image_Output_Pending_QC"
+# Operation: 'Copy' (safe testing) OR 'Move' (production)
+$Operation = 'Move'   # <-- change to 'Move' when you're ready
+# QC Run folder (today)
+$Today = (Get-Date).ToString("yyyy_MM_dd")
+$QcRoot = Join-Path $Root "1_QC_Admin\QC_In_Progress\Entom"
+$QcFolder = Join-Path $QcRoot "QC_Started_$Today"
+$DailyOriginalsRoot = Join-Path $QcFolder "Daily_Originals"
+$JpegSamplesRoot    = Join-Path $QcFolder "Jpeg_Samples"   # name preserved to match prior convention
+# Sampling parameters (as per your original script)
+$FamiliesPerTrigger = 5
+$ConfidenceZ = 1.645   # 90% confidence
+$MarginError = 0.1
+$P = 0.5
+# Output CSV (combined for all projects/daily folders)
+$CombinedCsv = Join-Path $QcFolder "Combined_Sampling_Report.csv"
+# Patterns / filters
+$DailyFolderPattern = '^\d{4}_\d{2}_\d{2}_.+$'    # e.g., 2026_03_04_Skye
+$ExcludeNamePattern = '(?i)thumb'                 # exclude filenames containing 'thumb' (case-insensitive)
+$ExcludeExtensions = @('.txt')                    # exclude .txt files
+# =========================
+# HELPERS
+# =========================
+function Get-HumanSize {
+    param([long]$bytes)
+    if ($bytes -ge 1GB) { return ("{0:N2} GB" -f ($bytes / 1GB)) }
+    elseif ($bytes -ge 1MB) { return ("{0:N2} MB" -f ($bytes / 1MB)) }
+    else { return ("{0:N2} KB" -f ($bytes / 1KB)) }
+}
+function Ensure-Folder {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+function Confirm-YesNo {
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [string]$Title = "Confirm"
+    )
+    $result = [System.Windows.MessageBox]::Show($Message, $Title, "YesNo", "Question")
+    return ($result -eq "Yes")
+}
+# Compose safe copy/move action
+function Invoke-CopyOrMove {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('Copy','Move')] [string]$Operation,
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Destination
+    )
+    Ensure-Folder -Path (Split-Path $Destination -Parent)
+    if ($Operation -eq 'Copy') {
+        Copy-Item -Path $Source -Destination $Destination -Recurse -Force
+    } else {
+        Move-Item -Path $Source -Destination $Destination
+    }
+}
+
+# =========================
+# DISCOVER PROJECTS (Entom*)
+# =========================
+if (-not (Test-Path $Root)) {
+    [System.Windows.MessageBox]::Show("Root path not found:`n$Root","Error","OK","Error") | Out-Null
+    exit 1
+}
+$ProjectFolders = Get-ChildItem -Path $Root -Directory |
+    Where-Object { $_.Name -like "Entom*" } |
+    Select-Object -ExpandProperty Name
+if (-not $ProjectFolders -or $ProjectFolders.Count -eq 0) {
+    [System.Windows.MessageBox]::Show("No 'Entom*' project folders found under:`n$Root","Nothing to do","OK","Information") | Out-Null
+    exit 0
+}
+# =========================
+# FIND DAILY FOLDERS PER PROJECT
+# =========================
+$DailySelections = @()  # list of PSCustomObjects: Project, DailyFolderName, FullPath
+$CountsByProject = @{}
+foreach ($proj in $ProjectFolders) {
+    $projPath = Join-Path $Root $proj
+    if (-not (Test-Path $projPath)) { continue }
+    # Only top-level daily folders (ignore QC_* / Action_Required / Jpegs / Jpgs)
+    $dailyFolders = Get-ChildItem -Path $projPath -Directory |
+        Where-Object {
+            $_.Name -match $DailyFolderPattern -and
+            $_.FullName -notmatch "QC_In_Progress" -and
+            $_.FullName -notmatch "QC_Started" -and
+            $_.FullName -notmatch "Action_Required" -and
+            $_.Name -notin @("Jpegs","Jpgs")
+        }
+    $CountsByProject[$proj] = ($dailyFolders | Measure-Object).Count
+    foreach ($df in $dailyFolders) {
+        $DailySelections += [PSCustomObject]@{
+            Project         = $proj
+            DailyFolderName = $df.Name
+            FullPath        = $df.FullName
+        }
+    }
+}
+# If nothing to do, exit
+if ($DailySelections.Count -eq 0) {
+    [System.Windows.MessageBox]::Show("No daily digitiser folders found to process.","Nothing to do","OK","Information") | Out-Null
+    exit 0
+}
+# =========================
+# CONFIRMATION POPUP
+# =========================
+$opVerb = ($Operation -eq 'Copy') ? 'COPY' : 'MOVE'
+$msg = "You are about to $opVerb:`n`n"
+$total = 0
+foreach ($proj in $ProjectFolders) {
+    $count = if ($CountsByProject.ContainsKey($proj)) { $CountsByProject[$proj] } else { 0 }
+    $msg += "• $count folders from $proj`n"
+    $total += $count
+}
+$msg += "`nTOTAL: $total folders`n"
+$msg += "`nDestination:`n$QcFolder`n`nProceed?"
+if (-not (Confirm-YesNo -Message $msg -Title "Confirm QC Folder $opVerb")) {
+    Write-Host "Operation cancelled. No changes made."
+    exit 0
+}
+# =========================
+# CREATE DESTINATION STRUCTURE
+# =========================
+Ensure-Folder -Path $QcRoot
+Ensure-Folder -Path $QcFolder
+Ensure-Folder -Path $DailyOriginalsRoot
+Ensure-Folder -Path $JpegSamplesRoot
+# =========================
+# COPY/MOVE DAILY FOLDERS (into Daily_Originals\{Project}\{DailyFolder})
+# =========================
+$RelocatedDailyFolders = @()  # Project, DailyFolderName, NewPath
+foreach ($item in $DailySelections) {
+    $destProjectFolder = Join-Path $DailyOriginalsRoot $item.Project
+    Ensure-Folder -Path $destProjectFolder
+    $destFolder = Join-Path $destProjectFolder $item.DailyFolderName
+    Invoke-CopyOrMove -Operation $Operation -Source $item.FullPath -Destination $destFolder
+    $RelocatedDailyFolders += [PSCustomObject]@{
+        Project         = $item.Project
+        DailyFolderName = $item.DailyFolderName
+        NewPath         = $destFolder
+    }
+    Write-Host ("{0}: {1} → {2}" -f $opVerb, $item.FullPath, $destFolder)
+}
+
+# =========================
+# SAMPLING + CSV ACCUMULATION (no copying yet)
+# =========================
+# We'll build a "copy plan" and only execute it AFTER the CSV is created
+$AllRows  = @()
+$CopyPlan = @()  # Each item: Project, DailyFolderName, SourcePath, DestPath
+foreach ($df in $RelocatedDailyFolders) {
+    $folder = Get-Item -LiteralPath $df.NewPath
+    Write-Host ""
+    Write-Host "--------------------------------------------"
+    Write-Host ("Sampling: {0} | {1}" -f $df.Project, $df.DailyFolderName)
+    Write-Host "--------------------------------------------"
+    # STEP 1 — Load files (non-recursive, match original logic)
+    $allFiles = Get-ChildItem -Path $folder.FullName -File |
+        Where-Object {
+            $_.Extension -notin $ExcludeExtensions -and
+            $_.Name -notmatch $ExcludeNamePattern
+        } |
+        Sort-Object CreationTime
+    if ($allFiles.Count -eq 0) {
+        Write-Host "  (No files found — skipping sampling for this folder)"
+        continue
+    }
+    # STEP 2 — Extract barcode (prefix before first underscore)
+    $filesWithBarcode = $allFiles | ForEach-Object {
+        [PSCustomObject]@{
+            File    = $_
+            Barcode = $_.BaseName.Split("_")[0]
+            Created = $_.CreationTime
+        }
+    }
+    # STEP 3 — Group into families
+    $families = $filesWithBarcode |
+        Group-Object Barcode |
+        ForEach-Object {
+            $familyFiles = $_.Group
+            $familyCreated = ($familyFiles | Sort-Object Created | Select-Object -First 1).Created
+            [PSCustomObject]@{
+                Barcode       = $_.Name
+                FamilyCreated = $familyCreated
+            }
+        } |
+        Sort-Object FamilyCreated
+    if ($families.Count -eq 0) {
+        Write-Host "  (No families detected — skipping)"
+        continue
+    }
+    # STEP 4 — Mandatory sampling
+    $sampleMap = @{}
+    # First N families per day
+    $families |
+        Group-Object { $_.FamilyCreated.Date } |
+        ForEach-Object {
+            $_.Group | Select-Object -First $FamiliesPerTrigger | ForEach-Object {
+                $sampleMap[$_.Barcode] = "DailyStart"
+            }
+        }
+    # Gaps > 1 hour
+    $lastTime = $null
+    for ($i = 0; $i -lt $families.Count; $i++) {
+        $fam = $families[$i]
+        if ($lastTime) {
+            $gapHours = ($fam.FamilyCreated - $lastTime).TotalHours
+            if ($gapHours -gt 1) {
+                for ($j = $i; $j -lt [Math]::Min($i + $FamiliesPerTrigger, $families.Count); $j++) {
+                    $sampleMap[$families[$j].Barcode] = "GapRestart"
+                }
+            }
+        }
+        $lastTime = $fam.FamilyCreated
+    }
+    # STEP 5 — Random sample
+    $remaining = $families | Where-Object { -not $sampleMap.ContainsKey($_.Barcode) }
+    if ($remaining.Count -gt 0) {
+        $n0 = [math]::Pow($ConfidenceZ, 2) * $P * (1 - $P) / [math]::Pow($MarginError, 2)
+        $n  = [math]::Round($n0 / (1 + (($n0 - 1) / $remaining.Count)))
+        if ($n -lt 1) { $n = 1 }
+        $rng = New-Object System.Random
+        $remaining |
+            Sort-Object { $rng.Next() } |
+            Select-Object -First $n |
+            ForEach-Object {
+                $sampleMap[$_.Barcode] = "Random"
+            }
+    }
+    # STEP 6 — Expand back to files (build CSV rows)
+    foreach ($f in $filesWithBarcode) {
+        $file = $f.File
+        $barcode = $f.Barcode
+        $sampled = $sampleMap.ContainsKey($barcode)
+        $AllRows += [PSCustomObject]@{
+            Project      = $df.Project
+            SourceFolder = $df.DailyFolderName
+            FullFilePath = $file.FullName
+            Filename     = $file.Name
+            Barcode      = $barcode
+            FileSize     = Get-HumanSize $file.Length
+            FileType     = $file.Extension.TrimStart(".")
+            CreatedDate  = $file.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
+            ModifiedDate = $file.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            Sampled      = if ($sampled) { "Yes" } else { "No" }
+            SampleReason = if ($sampled) { $sampleMap[$barcode] } else { "" }
+        }
+    }
+    # STEP 7 — Build "copy plan" for sampled files (but do not copy yet)
+    $destProjectDaily = Join-Path (Join-Path $JpegSamplesRoot $df.Project) $df.DailyFolderName
+    $sampledBarcodes = $sampleMap.Keys
+    if ($sampledBarcodes.Count -gt 0) {
+        $filesToCopy = $filesWithBarcode | Where-Object {
+            $sampleMap.ContainsKey($_.Barcode)
+        } | Select-Object -ExpandProperty File
+        foreach ($sf in $filesToCopy) {
+            $destPath = Join-Path $destProjectDaily $sf.Name
+            $CopyPlan += [PSCustomObject]@{
+                Project         = $df.Project
+                DailyFolderName = $df.DailyFolderName
+                SourcePath      = $sf.FullName
+                DestPath        = $destPath
+            }
+        }
+        Write-Host ("  Sampled families: {0}  →  Planned {1} files to: {2}" -f $sampledBarcodes.Count, $filesToCopy.Count, $destProjectDaily)
+    } else {
+        Write-Host "  No sampled barcodes in this folder."
+    }
+}
+# =========================
+# EXPORT COMBINED CSV (before any sampled copying)
+# =========================
+try {
+    if ($AllRows.Count -gt 0) {
+        $AllRows | Export-Csv -Path $CombinedCsv -NoTypeInformation -Encoding UTF8
+        Write-Host ""
+        Write-Host "🎉 Combined sampling CSV created:"
+        Write-Host $CombinedCsv
+        # Open the CSV now so you can inspect it / use for smaller copy-only scripts if needed
+        try {
+            Start-Process $CombinedCsv
+        } catch {
+            Write-Warning ("Could not open CSV: {0}" -f $_.Exception.Message)
+        }
+    } else {
+        Write-Host "No rows to export — Combined CSV not created."
+    }
+} catch {
+    Write-Warning ("Failed to export CSV: {0}" -f $_.Exception.Message)
+}
+# =========================
+# CONFIRMATION: copy sampled files now?
+# =========================
+# Count by project (optional message)
+$countsByProject = $CopyPlan | Group-Object Project | ForEach-Object {
+    [PSCustomObject]@{
+        Project = $_.Name
+        Count   = ($_.Group | Measure-Object).Count
+    }
+}
+$totalSamples = ($CopyPlan | Measure-Object).Count
+$copyMsg = "About to create sampled files from the plan:`n`n"
+foreach ($row in $countsByProject) {
+    $copyMsg += ("• {0}: {1} files`n" -f $row.Project, $row.Count)
+}
+$copyMsg += "`nTOTAL sampled files: $totalSamples`n"
+$copyMsg += "`nProceed to COPY sampled files into:`n$JpegSamplesRoot`n"
+if ($totalSamples -eq 0) {
+    [System.Windows.MessageBox]::Show("There are no sampled files to copy based on the plan.`nYou can still use the CSV.","No sampled files","OK","Information") | Out-Null
+    # Open QC folder for convenience and finish
+    try { Start-Process $QcFolder } catch {}
+    Write-Host "✅ Done."
+    exit 0
+}
+$confirmCopy = [System.Windows.MessageBox]::Show(
+    $copyMsg,
+    "Confirm sampled file COPY",
+    "YesNo",
+    "Question"
+)
+if ($confirmCopy -ne "Yes") {
+    Write-Host "Skipping sampled file copy at your request."
+    # Open QC folder for convenience and finish
+    try { Start-Process $QcFolder } catch {}
+    Write-Host "✅ Done."
+    exit 0
+}
+# =========================
+# EXECUTE COPY PLAN
+# =========================
+# Ensure destination folders exist and copy
+$copied = 0
+foreach ($item in $CopyPlan) {
+    $destFolder = Split-Path $item.DestPath -Parent
+    Ensure-Folder -Path $destFolder
+    try {
+        # Always copy sampled files (even if main op is Move)
+        Copy-Item -Path $item.SourcePath -Destination $item.DestPath -Force
+        $copied++
+        if (($copied % 100) -eq 0) {
+            Write-Host ("Copied {0}/{1} ..." -f $copied, $totalSamples)
+        }
+    } catch {
+        Write-Warning ("Failed to copy sampled file: {0} -> {1}  ({2})" -f $item.SourcePath, $item.DestPath, $_.Exception.Message)
+    }
+}
+Write-Host ("Copied {0} sampled files." -f $copied)
+# =========================
+# OPEN THE NEW QC FOLDER
+# =========================
+try {
+    Start-Process $QcFolder
+    Write-Host ("Opened: {0}" -f $QcFolder)
+} catch {
+    Write-Warning ("Could not open folder: {0}" -f $_.Exception.Message)
+}
+Write-Host ""
+Write-Host "✅ Done."
