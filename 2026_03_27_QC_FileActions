@@ -1,73 +1,93 @@
-
 # ================================
 #  QC File Actions Processing Script
 #  Paste-Into-PowerShell Version
-#  Updated for Import Path Fix + New CSV output
+#  Includes folder-name fixes & safe CSV auto-increment
 # ================================
+
 function Ensure-Folder {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
         New-Item -Path $Path -ItemType Directory -Force | Out-Null
     }
 }
+
 function New-SafeFilename {
     param(
         [string]$Folder,
         [string]$BaseName,
         [string]$Extension
     )
+
     $candidate = "$BaseName$Extension"
     $counter = 1
+
     while (Test-Path (Join-Path $Folder $candidate)) {
         $candidate = "$BaseName($counter)$Extension"
         $counter++
     }
+
     return $candidate
 }
+
 function Rename-FileSafely {
     param([object]$Row)
+
     $project = $Row.Project
     $sourceFolder = $Row.SourceFolder
     $originalName = $Row.FilenameOriginal
     $targetName = $Row.FilenameFinal
     $root = Get-Location
+
     if (-not $targetName) {
         return $originalName
     }
+
     $sourcePath = Join-Path $root "Daily_Originals\$project\$sourceFolder"
     $originalFile = Join-Path $sourcePath $originalName
+
     if (-not (Test-Path $originalFile)) {
         return $originalName
     }
+
     $origBase = [System.IO.Path]::GetFileNameWithoutExtension($originalName)
     $origExt  = [System.IO.Path]::GetExtension($originalName)
     $newBase  = [System.IO.Path]::GetFileNameWithoutExtension($targetName)
+
     $targetExt = $origExt
     $targetFile = Join-Path $sourcePath ($newBase + $targetExt)
+
     if (Test-Path $targetFile) {
         $tempName = New-SafeFilename -Folder $sourcePath -BaseName $newBase -Extension $targetExt
         Rename-Item -Path $targetFile -NewName $tempName -Force
         $targetFile = Join-Path $sourcePath ($newBase + $targetExt)
     }
+
     Rename-Item -Path $originalFile -NewName ($newBase + $targetExt) -Force
     return ($newBase + $targetExt)
 }
+
 function Copy-QCFailedFiles {
     param([object]$Row, [string]$CurrentName)
+
     $project = $Row.Project
     $sourceFolder = $Row.SourceFolder
     $root = Get-Location
+
     $trigger = (
         $Row.'Failed Cat 1 - Import, but send a reminder' -eq "Y" -or
         $Row.'Failed Cat 4 - Reimage necessary' -eq "Y" -or
         $Row.'Failed Cat 5 - delete image' -eq "Y"
     )
+
     if (-not $trigger) { return @() }
+
     $jpegPath = Join-Path $root "Jpeg_Samples\$project\$sourceFolder"
     $sourceFile = Join-Path $jpegPath $CurrentName
+
     if (-not (Test-Path $sourceFile)) {
         return @("QC Failed copy skipped: file not found: $sourceFile")
     }
+
     $results = @()
     $criteriaColumns = @(
         "CriteriaFailed",
@@ -76,109 +96,172 @@ function Copy-QCFailedFiles {
         "CriteriaFailed4",
         "CriteriaFailed5"
     )
+
     foreach ($col in $criteriaColumns) {
-        if ($Row.$col) {
-            $dest = "Y:\Digitisation_Image_Output_Pending_QC\1_QC_Admin\QC_Failed_Images\$project\$col"
+        $value = $Row.$col
+        if ($value) {
+            # ⭐ Folder name = CELL VALUE, not column name
+            $safe = $value.Replace(':','-').Replace('/','-').Replace('\','-')
+
+            $dest = "Y:\Digitisation_Image_Output_Pending_QC\1_QC_Admin\QC_Failed_Images\$project\$safe"
             Ensure-Folder $dest
+
             Copy-Item -Path $sourceFile -Destination $dest -Force
-            $results += "Copied to QC Failed: $col"
+            $results += "Copied to QC Failed: $safe"
         }
     }
+
     return $results
 }
+
 function Get-ImportProjectName {
     param([string]$Project, [string]$MainOrAdditional)
+
     if ($Project -eq "Entom-BritishColeoptera") {
         $base = "Pinned_BritishColeoptera"
     }
     else {
         $base = $Project -replace "^Entom-", ""
     }
+
     if ($MainOrAdditional -eq "Additional") {
         return ($base + "_additional")
     }
+
     return $base
 }
+
 function Process-ImportAction {
     param([object]$Row, [string]$CurrentName)
+
     $root = Get-Location
     $project = $Row.Project
     $sourceFolder = $Row.SourceFolder
     $AA = $Row.Import
     $F = $Row.MainOrAdditional
+
     $source = Join-Path $root "Daily_Originals\$project\$sourceFolder\$CurrentName"
+
     if (-not (Test-Path $source)) {
         return @("Import/Delete skipped: file missing: $source")
     }
+
     if ($AA -eq "N") {
         $destRoot = Join-Path $root "For_deletion"
         Ensure-Folder $destRoot
         Move-Item -Path $source -Destination $destRoot -Force
         return @("Moved to For_deletion")
     }
+
     $importName = Get-ImportProjectName -Project $project -MainOrAdditional $F
-    # ⭐ Corrected destination: now includes SourceFolder column
+
+    # ⭐ FIX: include SourceFolder in destination
     $importDest = "Y:\IMPORT_Entom\$importName\$sourceFolder"
     Ensure-Folder $importDest
+
     Copy-Item -Path $source -Destination $importDest -Force
     return @("Copied to IMPORT_Entom\$importName\$sourceFolder")
 }
+
 function Move-ToPostQC {
     param([object]$Row, [string]$CurrentName)
+
     if ($Row.Import -ne "Y") { return @() }
+
     $root = Get-Location
     $project = $Row.Project
     $sourceFolder = $Row.SourceFolder
+
     $source = Join-Path $root "Daily_Originals\$project\$sourceFolder\$CurrentName"
     if (-not (Test-Path $source)) {
         return @("PostQC skipped: file missing: $source")
     }
+
     $dest = "Y:\DCP-Digitisers\$project\PostQC\$sourceFolder"
     Ensure-Folder $dest
+
     Move-Item -Path $source -Destination $dest -Force
     return @("Moved to PostQC")
 }
+
 function Log-Action {
     param([object]$Row, [array]$Messages)
     $Row.'Actions Taken by Script' = ($Messages -join "; ")
 }
+
 # ================================
 #  MAIN EXECUTION LOOP
 # ================================
+
 $csvPath = Join-Path (Get-Location) "QC_FileActions.csv"
 $csv = Import-Csv $csvPath
+
 if (-not ($csv | Get-Member -Name 'Actions Taken by Script')) {
     foreach ($r in $csv) {
         $r | Add-Member -Name 'Actions Taken by Script' -Value "" -MemberType NoteProperty
     }
 }
+
 $total = $csv.Count
 $index = 1
+
 foreach ($row in $csv) {
+
     Write-Progress -Activity "Processing rows" -Status ("Row {0} of {1}" -f $index, $total)
+
     if ($row.'Actions Taken by Script') {
         $index++
         continue
     }
+
     $actions = @()
+
     try {
         $currentName = Rename-FileSafely -Row $row
         $actions += "Filename used: $currentName"
+
         $actions += Copy-QCFailedFiles -Row $row -CurrentName $currentName
+
         $actions += Process-ImportAction -Row $row -CurrentName $currentName
+
         $actions += Move-ToPostQC -Row $row -CurrentName $currentName
     }
     catch {
         $actions += ("ERROR: " + $_.Exception.Message)
         Write-Host ("ERROR row {0}: {1}" -f $index, $_.Exception.Message) -ForegroundColor Red
     }
+
     Log-Action -Row $row -Messages $actions
     $index++
 }
+
 # ================================
-#  WRITE TO NEW CSV (SAFE EXPORT)
+#  SAFE CSV EXPORT WITH AUTOINCREMENT
 # ================================
-$processed = Join-Path (Get-Location) "QC_FileActions_processed.csv"
-$csv | Export-Csv $processed -NoTypeInformation -Force
+
+$baseName = "QC_FileActions_processed"
+$folder   = Get-Location
+$ext      = ".csv"
+
+$counter = 0
+do {
+    $fileName = if ($counter -eq 0) {
+        "$baseName$ext"
+    } else {
+        "$baseName($counter)$ext"
+    }
+
+    $fullPath = Join-Path $folder $fileName
+    $counter++
+} while (Test-Path $fullPath)
+
+try {
+    $csv | Export-Csv $fullPath -NoTypeInformation -Force
+    Write-Host "Processed CSV saved as: $fullPath" -ForegroundColor Cyan
+}
+catch {
+    Write-Host "ERROR: Could not write CSV." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+}
+
 Write-Host "Processing complete!" -ForegroundColor Green
-Write-Host "Processed CSV saved as: $processed" -ForegroundColor Cyan
