@@ -1,0 +1,391 @@
+###############################################################
+#   Create-Botany-QC-Run.ps1
+#   Botany version — TIFF → JPEG sampled extraction
+###############################################################
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName System.Drawing
+
+# =========================
+# SETTINGS
+# =========================
+
+# Botany root folder
+$Root = "Y:\Digitisation_Image_Output_Pending_QC"
+
+# Operation used for Daily folders (Copy or Move)
+$Operation = "Move"
+
+# QC folder naming
+$Today = (Get-Date).ToString("yyyy_MM_dd")
+$QcRoot = Join-Path $Root "1_QC_Admin\QC_In_Progress\Botany"
+$QcFolder = Join-Path $QcRoot "QC_Started_$Today"
+$DailyOriginalsRoot = Join-Path $QcFolder "Daily_Originals"
+$JpegSamplesRoot    = Join-Path $QcFolder "Jpeg_Samples"
+
+# Sampling params
+$FamiliesPerTrigger = 5
+$ConfidenceZ = 1.645
+$MarginError = 0.1
+$P = 0.5
+
+# CSV
+$CombinedCsv = Join-Path $QcFolder "Combined_Sampling_Report.csv"
+
+# Filtering
+$DailyFolderPattern = '^\d{4}_\d{2}_\d{2}_.+$'
+$ExcludeNamePattern = '(?i)thumb'
+$ExcludeExtensions = @(".txt")
+
+# =========================
+# HELPERS
+# =========================
+
+function Ensure-Folder {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+function Confirm-YesNo {
+    param(
+        [string]$Message,
+        [string]$Title = "Confirm"
+    )
+    $result = [System.Windows.MessageBox]::Show($Message, $Title, "YesNo", "Question")
+    return ($result -eq "Yes")
+}
+
+function Invoke-CopyOrMove {
+    param(
+        [ValidateSet("Copy","Move")]$Operation,
+        [string]$Source,
+        [string]$Destination
+    )
+    Ensure-Folder (Split-Path $Destination -Parent)
+    if ($Operation -eq "Copy") {
+        Copy-Item $Source $Destination -Recurse -Force
+    } else {
+        Move-Item $Source $Destination
+    }
+}
+
+# =========================
+# TIFF → JPEG conversion (60% size, 80% quality)
+# =========================
+
+function Convert-TiffToJpeg {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+
+    Ensure-Folder -Path (Split-Path $Destination -Parent)
+
+    $img = [System.Drawing.Image]::FromFile($Source)
+
+    try {
+        # Compute scaled size @60%
+        $newWidth  = $img.Width * 0.6
+        $newHeight = $img.Height * 0.6
+
+        $bmp = New-Object System.Drawing.Bitmap $newWidth, $newHeight
+
+        $graphics = [System.Drawing.Graphics]::FromImage($bmp)
+        $graphics.CompositingQuality = "HighQuality"
+        $graphics.InterpolationMode  = "HighQualityBicubic"
+        $graphics.SmoothingMode      = "HighQuality"
+
+        # Draw scaled
+        $graphics.DrawImage($img, 0, 0, $newWidth, $newHeight)
+
+        # JPEG encoder
+        $encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+            Where-Object { $_.MimeType -eq "image/jpeg" }
+
+        $params = New-Object System.Drawing.Imaging.EncoderParameters(1)
+        $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter(
+            [System.Drawing.Imaging.Encoder]::Quality, 80L)
+
+        # Save JPEG
+        $bmp.Save($Destination, $encoder, $params)
+    }
+    finally {
+        $graphics.Dispose()
+        $bmp.Dispose()
+        $img.Dispose()
+    }
+}
+
+# =========================
+# DISCOVER PROJECTS (Bot*)
+# =========================
+
+if (-not (Test-Path $Root)) {
+    [System.Windows.MessageBox]::Show("Root not found: $Root") | Out-Null
+    exit
+}
+
+$ProjectFolders = Get-ChildItem $Root -Directory |
+    Where-Object { $_.Name -like "Bot*" } |
+    Select-Object -Expand Name
+
+if ($ProjectFolders.Count -eq 0) {
+    [System.Windows.MessageBox]::Show("No Bot* projects found.") | Out-Null
+    exit
+}
+
+# =========================
+# FIND DAILY FOLDERS
+# =========================
+
+$DailySelections = @()
+$CountsByProject = @{}
+
+foreach ($proj in $ProjectFolders) {
+    $path = Join-Path $Root $proj
+    if (-not (Test-Path $path)) { continue }
+
+    $daily = Get-ChildItem $path -Directory |
+        Where-Object {
+            $_.Name -match $DailyFolderPattern -and
+            $_.FullName -notmatch "QC_" -and
+            $_.Name -notin @("Jpegs","Jpgs")
+        }
+
+    $CountsByProject[$proj] = $daily.Count
+
+    foreach ($df in $daily) {
+        $DailySelections += [PSCustomObject]@{
+            Project = $proj
+            DailyFolderName = $df.Name
+            FullPath = $df.FullName
+        }
+    }
+}
+
+if ($DailySelections.Count -eq 0) {
+    [System.Windows.MessageBox]::Show("No daily folders found.") | Out-Null
+    exit
+}
+
+# =========================
+# CONFIRMATION POPUP
+# =========================
+
+$msg = "You are about to MOVE Botany daily folders into: `n$QcFolder`n`nCounts:`n"
+foreach ($proj in $ProjectFolders) {
+    $msg += "  $proj : $($CountsByProject[$proj])`n"
+}
+$msg += "`nProceed?"
+
+if (-not (Confirm-YesNo $msg "Confirm Botany QC Creation")) {
+    exit
+}
+
+# =========================
+# CREATE DESTINATION STRUCTURE
+# =========================
+
+Ensure-Folder $QcRoot
+Ensure-Folder $QcFolder
+Ensure-Folder $DailyOriginalsRoot
+Ensure-Folder $JpegSamplesRoot
+
+# =========================
+# MOVE DAILY FOLDERS
+# =========================
+
+$RelocatedDailyFolders = @()
+
+foreach ($item in $DailySelections) {
+    $destProj = Join-Path $DailyOriginalsRoot $item.Project
+    $destPath = Join-Path $destProj $item.DailyFolderName
+    Ensure-Folder $destProj
+
+    Invoke-CopyOrMove -Operation $Operation `
+        -Source $item.FullPath `
+        -Destination $destPath
+
+    $RelocatedDailyFolders += [PSCustomObject]@{
+        Project = $item.Project
+        DailyFolderName = $item.DailyFolderName
+        NewPath = $destPath
+    }
+}
+
+# =========================
+# SAMPLING + BUILD COPY PLAN
+# =========================
+
+$AllRows = @()
+$CopyPlan = @()
+
+function Get-HumanSize([long]$b) {
+    if ($b -ge 1GB) { return "{0:N2} GB" -f ($b/1GB) }
+    elseif ($b -ge 1MB) { return "{0:N2} MB" -f ($b/1MB) }
+    else { return "{0:N2} KB" -f ($b/1KB) }
+}
+
+foreach ($df in $RelocatedDailyFolders) {
+
+    $folderPath = $df.NewPath
+    $files = Get-ChildItem $folderPath -File |
+        Where-Object {
+            $_.Extension -notin $ExcludeExtensions -and
+            $_.Name -notmatch $ExcludeNamePattern
+        } |
+        Sort-Object CreationTime
+
+    if ($files.Count -eq 0) { continue }
+
+    # Extract family barcode before first underscore
+    $filesWithBarcode = $files | ForEach-Object {
+        [PSCustomObject]@{
+            File = $_
+            Barcode = $_.BaseName.Split("_")[0]
+            Created = $_.CreationTime
+        }
+    }
+
+    # Build families for sampling
+    $families = $filesWithBarcode |
+        Group-Object Barcode |
+        ForEach-Object {
+            $firstCreated = ($_.Group | Sort-Object Created | Select -First 1).Created
+            [PSCustomObject]@{
+                Barcode = $_.Name
+                FirstCreated = $firstCreated
+            }
+        } |
+        Sort-Object FirstCreated
+
+    # Mandatory per-day sampling
+    $sampleMap = @{}
+
+    $families |
+        Group-Object { $_.FirstCreated.Date } |
+        ForEach-Object {
+            $_.Group | Select-Object -First $FamiliesPerTrigger |
+                ForEach-Object { $sampleMap[$_.Barcode] = "DailyStart" }
+        }
+
+    # Gaps > 1 hour
+    $last = $null
+    for ($i = 0; $i -lt $families.Count; $i++) {
+        $f = $families[$i]
+        if ($last) {
+            if (($f.FirstCreated - $last).TotalHours -gt 1) {
+                for ($j = $i; $j -lt :Min($i + $FamiliesPerTrigger, $families.Count); $j++) {
+                    $sampleMap[$families[$j].Barcode] = "GapRestart"
+                }
+            }
+        }
+        $last = $f.FirstCreated
+    }
+
+    # Random sampling
+    $remaining = $families | Where-Object { -not $sampleMap.ContainsKey($_.Barcode) }
+    if ($remaining.Count -gt 0) {
+        $n0 = :Pow($ConfidenceZ,2)*$P*(1-$P)/:Pow($MarginError,2)
+        $n  = :Round($n0/(1+(($n0-1)/$remaining.Count)))
+        if ($n -lt 1) { $n = 1 }
+
+        $rng = New-Object System.Random
+        $remaining |
+            Sort-Object { $rng.Next() } |
+            Select -First $n |
+            ForEach-Object { $sampleMap[$_.Barcode] = "Random" }
+    }
+
+    # Build rows for CSV
+    foreach ($fw in $filesWithBarcode) {
+        $file = $fw.File
+        $barcode = $fw.Barcode
+
+        $sampled = $sampleMap.ContainsKey($barcode)
+        $reason  = if ($sampled) { $sampleMap[$barcode] } else { "" }
+
+        $AllRows += [PSCustomObject]@{
+            Project = $df.Project
+            SourceFolder = $df.DailyFolderName
+            FullFilePath = $file.FullName
+            Filename     = $file.Name
+            Barcode      = $barcode
+            FileSize     = Get-HumanSize $file.Length
+            FileType     = $file.Extension.TrimStart(".")
+            CreatedDate  = $file.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
+            ModifiedDate = $file.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            Sampled      = if ($sampled) { "Yes" } else { "No" }
+            SampleReason = $reason
+        }
+
+        # Build copy plan for sampled TIFFs
+        if ($sampled -and $file.Extension -match "tif|tiff") {
+            $destProj = Join-Path $JpegSamplesRoot $df.Project
+            $destDaily = Join-Path $destProj $df.DailyFolderName
+            $destFile = Join-Path $destDaily ($file.BaseName + ".jpg")
+
+            $CopyPlan += [PSCustomObject]@{
+                Project = $df.Project
+                DailyFolderName = $df.DailyFolderName
+                SourcePath = $file.FullName
+                DestPath   = $destFile
+            }
+        }
+    }
+}
+
+# =========================
+# EXPORT COMBINED CSV
+# =========================
+
+if ($AllRows.Count -gt 0) {
+    Ensure-Folder $QcFolder
+    $AllRows | Export-Csv -Path $CombinedCsv -NoTypeInformation -Encoding UTF8
+    Start-Process $CombinedCsv
+}
+
+# =========================
+# CONFIRM CONVERSION OF SAMPLED FILES
+# =========================
+
+$total = $CopyPlan.Count
+
+$confirmMsg = "Convert $total sampled TIFFs to JPEG (60%) into:" +
+    "`n$JpegSamplesRoot`n`nProceed?"
+
+if ($total -eq 0) {
+    Start-Process $QcFolder
+    exit
+}
+
+if (-not (Confirm-YesNo $confirmMsg "Convert TIFF Samples")) {
+    Start-Process $QcFolder
+    exit
+}
+
+# =========================
+# EXECUTE CONVERSION PLAN
+# =========================
+
+$counter = 0
+
+foreach ($item in $CopyPlan) {
+    try {
+        $counter++
+        Convert-TiffToJpeg -Source $item.SourcePath -Destination $item.DestPath
+        if ($counter % 50 -eq 0) {
+            Write-Host "$counter / $total converted..."
+        }
+    }
+    catch {
+        Write-Warning "Failed to convert: $($item.SourcePath)"
+    }
+}
+
+Write-Host "Converted $counter files."
+
+Start-Process $QcFolder
+Write-Host "Botany QC folder ready."
